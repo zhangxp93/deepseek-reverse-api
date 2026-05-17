@@ -235,6 +235,7 @@ config.json
 examples/
 pool/
 test_*.py
+test/*.py
 *.log
 /example
 CHANGELOG.md
