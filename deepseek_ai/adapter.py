@@ -51,11 +51,32 @@ class DeepSeekAdapter:
         self.use_proxy = use_proxy
         
         if use_proxy:
-            self.proxy_manager = get_proxy_manager()
-            if not hasattr(self.proxy_manager, '_initialized') or not self.proxy_manager._initialized:
-                self.proxy_manager = init_proxy_manager()
-                self.proxy_manager._initialized = True
-            self.session = self.proxy_manager.create_session(use_vless=True)
+            try:
+                self.proxy_manager = get_proxy_manager()
+                if not hasattr(self.proxy_manager, '_initialized') or not self.proxy_manager._initialized:
+                    self.proxy_manager = init_proxy_manager()
+                    self.proxy_manager._initialized = True
+                self.session = self.proxy_manager.create_session(use_vless=True)
+            except Exception as e:
+                # If proxy initialization fails, fall back to regular session
+                import logging
+                logger = logging.getLogger(__name__)
+                logger.warning(f'Proxy initialization failed, falling back to direct connection: {e}')
+                self.session = requests.Session()
+                from requests.adapters import HTTPAdapter
+                from urllib3.util.retry import Retry
+                
+                adapter = HTTPAdapter(
+                    pool_connections=10,
+                    pool_maxsize=10,
+                    max_retries=Retry(
+                        total=3,
+                        backoff_factor=0.5,
+                        status_forcelist=[500, 502, 503, 504]
+                    )
+                )
+                self.session.mount('https://', adapter)
+                self.session.mount('http://', adapter)
         else:
             self.session = requests.Session()
             from requests.adapters import HTTPAdapter
@@ -107,32 +128,55 @@ class DeepSeekAdapter:
             return self._access_token
         
         url = f'{self.DEEPSEEK_API_BASE}/v0/users/current'
-        response = self.session.get(
-            url,
-            headers={
-                'Authorization': f'Bearer {self.token}',
-                **self.get_headers()
-            },
-            timeout=15
-        )
+        max_retries = 3
+        last_error = None
         
-        if response.status_code in [401, 403]:
-            raise ValueError('Token invalid or expired, please get a new token')
+        for attempt in range(max_retries):
+            try:
+                response = self.session.get(
+                    url,
+                    headers={
+                        'Authorization': f'Bearer {self.token}',
+                        **self.get_headers()
+                    },
+                    timeout=15
+                )
+                
+                if response.status_code in [401, 403]:
+                    raise ValueError('Token invalid or expired, please get a new token')
+                
+                if response.status_code != 200:
+                    raise ValueError(f'Failed to acquire token: HTTP {response.status_code}')
+                
+                data = response.json()
+                biz_data = data.get('data', {}).get('biz_data') or data.get('biz_data')
+                
+                if not biz_data or not biz_data.get('token'):
+                    error_msg = data.get('msg') or data.get('data', {}).get('biz_msg') or 'Unknown error'
+                    raise ValueError(f'Failed to acquire token: {error_msg}')
+                
+                self._access_token = biz_data['token']
+                self._token_expires_at = int(time.time()) + 3600
+                
+                return self._access_token
+                
+            except requests.exceptions.SSLError as e:
+                last_error = e
+                import logging
+                logger = logging.getLogger(__name__)
+                logger.warning(f'SSL error on attempt {attempt + 1}/{max_retries}: {e}')
+                if attempt < max_retries - 1:
+                    time.sleep(1 * (attempt + 1))  # Exponential backoff
+                    continue
+                raise ValueError(f'SSL connection failed after {max_retries} attempts: {e}')
+            except Exception as e:
+                last_error = e
+                if attempt < max_retries - 1:
+                    time.sleep(1 * (attempt + 1))
+                    continue
+                raise ValueError(f'Failed to acquire token: {e}')
         
-        if response.status_code != 200:
-            raise ValueError(f'Failed to acquire token: HTTP {response.status_code}')
-        
-        data = response.json()
-        biz_data = data.get('data', {}).get('biz_data') or data.get('biz_data')
-        
-        if not biz_data or not biz_data.get('token'):
-            error_msg = data.get('msg') or data.get('data', {}).get('biz_msg') or 'Unknown error'
-            raise ValueError(f'Failed to acquire token: {error_msg}')
-        
-        self._access_token = biz_data['token']
-        self._token_expires_at = int(time.time()) + 3600
-        
-        return self._access_token
+        raise ValueError(f'Failed to acquire token after {max_retries} attempts: {last_error}')
     
     def create_session(self) -> str:
         """Create a new chat session"""

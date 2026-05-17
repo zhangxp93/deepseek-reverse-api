@@ -407,6 +407,10 @@ class VlessProxyPool:
             (成功数量, 失败数量)
         """
         try:
+            if not os.path.exists(filepath):
+                logger.warning(f'Proxy file {filepath} does not exist, skipping')
+                return 0, 0
+            
             with open(filepath, 'r', encoding='utf-8') as f:
                 uris = [line.strip() for line in f if line.strip() and not line.startswith('#')]
             return self.add_proxies_from_uris(uris)
